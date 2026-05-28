@@ -39,3 +39,6 @@ openbridge = "openbridge.cli:main"
 where = ["."]
 include = ["openbridge*"]
 exclude = ["tests*", "examples*"]
+
+[tool.setuptools.package-data]
+openbridge = ["_skills/openbridge/SKILL.md"]

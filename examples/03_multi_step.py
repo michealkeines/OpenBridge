@@ -1,16 +1,15 @@
 """Pattern 3 — Multi-step per item.
 
 Each logical item triggers two ask() calls: first to classify, then to
-write — and the second prompt is shaped by the first's answer.
+write — and the second prompt is shaped by the first's answer. Workers
+are spawned automatically (each topic produces TWO work items, so two
+workers keep things moving).
 
 Run:
     python examples/03_multi_step.py
-
-In a worker terminal (or Claude session):
-    openbridge get --pool multistep   # ... then submit ...
-    # each TOPIC produces TWO work items: <topic>#classify and <topic>#write
 """
 from openbridge import Bridge
+from openbridge.spawn import spawn_workers
 
 TOPICS = [
     "the role of mitochondria in eukaryotic cells",
@@ -58,10 +57,11 @@ async def process(topic: str) -> dict:
 
 
 async def main() -> None:
-    for topic in TOPICS:
-        result = await process(topic)
-        print(f"  {topic}: {result.get('label', '-')}  "
-              f"({len(result.get('summary', ''))} chars)")
+    async with spawn_workers(bridge, count=2):
+        for topic in TOPICS:
+            result = await process(topic)
+            print(f"  {topic}: {result.get('label', '-')}  "
+                  f"({len(result.get('summary', ''))} chars)")
 
 
 if __name__ == "__main__":

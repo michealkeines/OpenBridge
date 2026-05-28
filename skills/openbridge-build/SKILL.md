@@ -83,6 +83,49 @@ Read/write JSON files in the workdir for crash recovery. Library never auto-save
 
 Wrap your `main()`. Acquires the singleton lock (30s heartbeat-refreshed TTL), clears stale Redis queues, registers the workdir pointer, runs the coroutine, releases everything on exit.
 
+### `openbridge.spawn.spawn_workers(bridge, *, count, recycle=False, max_jobs_per_session=1)`
+
+Optional **additive** layer (does not change `Bridge`'s API). Async
+context manager that spawns `count` `claude` subprocesses bound to
+`bridge`'s pool. The bundled openbridge SKILL is loaded into each
+subprocess via `--append-system-prompt-file`, so they consume the pool
+autonomously.
+
+```python
+from openbridge.spawn import spawn_workers
+
+async def main():
+    async with spawn_workers(bridge, count=4):
+        # producer publishes work; the spawned claude sessions consume it
+        for item in items:
+            await bridge.ask(...)
+```
+
+Always enforced (non-configurable for safety):
+
+- `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are stripped from the
+  child env → sessions use your `claude` OAuth subscription, never
+  API billing.
+- `--dangerously-skip-permissions` is always passed → sessions never
+  block on permission prompts.
+- `claude` is located via `$OPENBRIDGE_CLAUDE_BIN`, then `$PATH`, then
+  common install paths.
+
+Modes:
+
+- `recycle=False` (default) — each worker is one long-lived Claude
+  session that drives the pool until drained.
+- `recycle=True, max_jobs_per_session=1` — each session processes one
+  item then exits; supervisor respawns immediately. Cleanest context.
+- `recycle=True, max_jobs_per_session=N` — each session processes up
+  to N items before recycling. Amortizes Claude startup cost over more
+  items at the cost of a larger per-session context window. Typical
+  values: 3–10.
+
+Workers are still optional — customers can supply their own (manual
+Claude sessions, or shell `openbridge get / submit` loops). Both modes
+coexist on the same pool.
+
 ## Architecture
 
 Per-work-item routing through pool-keyed Redis lists.
@@ -250,13 +293,19 @@ openbridge/
 ├── __main__.py              python -m openbridge entry point
 ├── bridge.py                Bridge class + ask/checkpoint/save/serve
 ├── cli.py                   operator CLI (get/submit/skip/list/...)
-└── redis_runtime.py         Docker bootstrap (ensure_redis / stop_redis)
+├── spawn.py                 spawn_workers — auto-spawn claude subprocesses
+├── redis_runtime.py         Docker bootstrap (ensure_redis / stop_redis)
+└── _skills/openbridge/SKILL.md   bundled worker skill (used by spawn_workers)
 
 skills/
-├── openbridge/SKILL.md      operator skill (drive a pool)
+├── openbridge/SKILL.md      operator skill (drive a pool); canonical source
 └── openbridge-build/SKILL.md  this file (build a producer)
 
-examples/word_classifier.py  ~30-line working example
+examples/
+├── 01..07_*.py              the seven core patterns (all use spawn_workers)
+├── 97_recycled_workers.py   recycle + max_jobs_per_session demo
+├── 98_spawned_workers.py    smallest spawn_workers demo
+└── 99_local_smoketest.py    in-process auto-worker (no claude required)
 ```
 
 ## Gotchas

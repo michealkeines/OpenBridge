@@ -1,6 +1,6 @@
 # Patterns
 
-Seven patterns, each with a runnable example under `examples/`. Pick the
+Eight patterns, each with a runnable example under `examples/`. Pick the
 one closest to your workload, copy it, adapt.
 
 | # | Pattern | When to use | Example |
@@ -12,8 +12,27 @@ one closest to your workload, copy it, adapt.
 | 5 | Stage-to-stage pipeline | Stage A's output is the queue for stage B | [`05_pipeline.py`](../examples/05_pipeline.py) |
 | 6 | Multi-producer one pool | Several Python scripts feeding a shared worker pool | [`06_multi_producer.py`](../examples/06_multi_producer.py) |
 | 7 | Resume from disk | Long runs that must survive producer restarts | [`07_resume.py`](../examples/07_resume.py) |
+| 8 | Recycled workers (fresh session per item) | Long batches where session context bloat would force compaction | [`97_recycled_workers.py`](../examples/97_recycled_workers.py) |
 
-Patterns combine — a real skill might fan out, validate, AND resume.
+Patterns combine — a real skill might fan out, validate, recycle, AND resume.
+
+## Workers come from where?
+
+Every pattern below ships a producer that drives a pool. Workers can be
+supplied in two ways:
+
+1. **Auto-spawned via `spawn_workers`** — the producer launches `claude`
+   subprocesses internally. This is what every numbered example does
+   now; no second terminal required. Uses your Claude subscription
+   (never API billing) and runs `--dangerously-skip-permissions` so
+   sessions are fully autonomous.
+2. **Manually** — you run `openbridge get / submit / skip` from your
+   own interactive Claude Code sessions or shell scripts. Same pool, no
+   coordination required; both modes can coexist.
+
+The snippets below show the `spawn_workers` form. To run manually
+instead, just remove the `async with spawn_workers(...)` wrapper and
+drive the pool yourself.
 
 ---
 
@@ -26,25 +45,24 @@ matters more than throughput.
 
 ```python
 from openbridge import Bridge
+from openbridge.spawn import spawn_workers
 bridge = Bridge(name="serial", pool="serial")
 
 async def main():
-    for word in ["aurora", "lament", "ponder"]:
-        r = await bridge.ask(
-            item_id=word,
-            prompt=f"Classify {word!r} as noun/verb/adjective.",
-            template={"word": word, "part_of_speech": ""},
-        )
-        print(f"{word} → {r.data['part_of_speech']}")
+    async with spawn_workers(bridge, count=1):
+        for word in ["aurora", "lament", "ponder"]:
+            r = await bridge.ask(
+                item_id=word,
+                prompt=f"Classify {word!r} as noun/verb/adjective.",
+                template={"word": word, "part_of_speech": ""},
+            )
+            print(f"{word} → {r.data['part_of_speech']}")
 
 bridge.serve(main())
 ```
 
-**Drive it:** one worker, processing items one at a time.
-
-```bash
-openbridge get --pool serial      # repeat until DAEMON DONE
-```
+The single spawned worker processes items one at a time; the producer
+exits cleanly when the loop finishes.
 
 **See:** [`examples/01_serial_loop.py`](../examples/01_serial_loop.py)
 
@@ -61,6 +79,7 @@ have multiple Claude sessions available as workers.
 ```python
 import asyncio
 from openbridge import Bridge
+from openbridge.spawn import spawn_workers
 bridge = Bridge(name="fanout", pool="fanout")
 
 async def main():
@@ -74,21 +93,16 @@ async def main():
                 template={"item": item, "result": ""},
             )
 
-    results = await asyncio.gather(*(one(i) for i in items))
-    print(f"got {len(results)} results")
+    async with spawn_workers(bridge, count=5):   # 5 claude sessions in parallel
+        results = await asyncio.gather(*(one(i) for i in items))
+        print(f"got {len(results)} results")
 
 bridge.serve(main())
 ```
 
-**Drive it:** N workers in N terminals. Each `openbridge get` claims a
-different item via atomic BRPOP.
-
-```bash
-# in 5 separate terminals (or 5 Claude sessions)
-while true; do
-  openbridge get --pool fanout       # work, then submit, repeat
-done
-```
+The five spawned workers each claim a different item via atomic BRPOP;
+the semaphore caps in-flight items so the producer doesn't outrun the
+workers.
 
 **Tradeoff:** the semaphore caps in-flight items. Set it ≥ your worker
 count or workers will sit idle waiting for new publishes.
@@ -327,6 +341,75 @@ async def main():
 it. Same idea, just collocated with the rest of the workdir.
 
 **See:** [`examples/07_resume.py`](../examples/07_resume.py)
+
+---
+
+## Pattern 8 — Recycled workers (bounded-context sessions)
+
+**Shape:** pass `recycle=True` to `spawn_workers`. Each worker session
+processes a bounded number of items (`max_jobs_per_session`, default 1)
+then exits; a supervisor spawns a replacement.
+
+**When to use:** long-running batches (hundreds to thousands of items)
+where a single Claude session would eventually accumulate enough
+context to trigger compaction. With recycling, every session starts
+with a clean context window, so compaction is impossible by
+construction.
+
+```python
+from openbridge import Bridge
+from openbridge.spawn import spawn_workers
+bridge = Bridge(name="big-batch", pool="big-batch")
+
+async def main():
+    # Default: every item gets a fresh session (max isolation, max overhead).
+    async with spawn_workers(bridge, count=4, recycle=True):
+        for item in ALL_ITEMS:
+            await bridge.ask(item_id=item, prompt=..., template=...)
+
+bridge.serve(main())
+```
+
+**Amortizing startup cost:** raise `max_jobs_per_session` to handle
+more items per session. The supervisor only spawns a fresh process
+every N items, so the per-item startup tax drops by a factor of N:
+
+```python
+# Process up to 5 items per session, then recycle.
+async with spawn_workers(bridge, count=4, recycle=True,
+                         max_jobs_per_session=5):
+    ...
+```
+
+**Picking `max_jobs_per_session`:**
+
+| Per-item context | Reasonable value |
+|---|---|
+| Large reads, many tool calls per item | `1` |
+| Typical text extraction / classification | `3–5` |
+| Small / single-turn items | `10+` |
+
+**Trade-off:** each spawn pays ~5–10s of Claude startup latency
+(authentication, skill load, model warm-up). Use `recycle=False`
+(default) when batches are short or items are very small — there the
+startup tax dominates the work.
+
+**How it works internally:**
+
+- The user-level prompt sent to each subprocess is overridden to
+  "process EXACTLY ONE item, then exit." The SKILL honors this
+  override (see the *How this skill is loaded* section of
+  `skills/openbridge/SKILL.md`).
+- A supervisor coroutine per worker slot watches the subprocess; when
+  it exits (zero or non-zero), the supervisor spawns a replacement
+  with an incremented generation counter (`worker-0.gen0`, `gen1`, …).
+  Worker logs accumulate across generations at
+  `<workdir>/workers/worker-N.log`.
+- A crash-loop guard backs off (1s → 2s → … → 30s) if a worker exits
+  within 5 seconds of spawn, so a misconfigured environment doesn't
+  thrash the pool.
+
+**See:** [`examples/97_recycled_workers.py`](../examples/97_recycled_workers.py)
 
 ---
 

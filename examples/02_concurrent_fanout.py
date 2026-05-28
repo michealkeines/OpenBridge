@@ -2,22 +2,15 @@
 
 The producer issues N concurrent ask() calls via asyncio.gather. A
 semaphore caps in-flight work items so the pool doesn't grow unbounded.
-
-Start N worker sessions in parallel, each running `openbridge get` in
-a loop, and they cooperatively drain the queue with no driver collision.
+N claude worker sessions are spawned automatically and cooperatively
+drain the queue.
 
 Run:
-    python examples/02_concurrent_fanout.py    # producer (any terminal)
-
-In N separate terminals (or Claude sessions):
-    while true; do
-      openbridge get --pool fanout || break
-      # ... do the work the prompt describes ...
-      # submit / skip with the work_id from the get footer
-    done
+    python examples/02_concurrent_fanout.py
 """
 import asyncio
 from openbridge import Bridge
+from openbridge.spawn import spawn_workers
 
 WORDS = ["aurora", "lament", "swift", "harbor", "candid", "ponder",
          "bramble", "torpid", "verdant", "nadir"]
@@ -42,12 +35,13 @@ async def main() -> None:
                 results[word] = (r.data.get("part_of_speech")
                                  if not r.skipped else "(skipped)")
 
-    # Gather collects all tasks; return_exceptions keeps one failure
-    # from cancelling siblings mid-flight.
-    await asyncio.gather(
-        *(process(w) for w in WORDS),
-        return_exceptions=True,
-    )
+    async with spawn_workers(bridge, count=CONCURRENCY):
+        # Gather collects all tasks; return_exceptions keeps one failure
+        # from cancelling siblings mid-flight.
+        await asyncio.gather(
+            *(process(w) for w in WORDS),
+            return_exceptions=True,
+        )
 
     print(f"done — {len(results)} items processed across "
           f"up to {CONCURRENCY} concurrent workers")

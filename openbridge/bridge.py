@@ -177,7 +177,12 @@ class Bridge:
 
     async def _r(self) -> aioredis.Redis:
         if self._redis is None:
-            self._redis = aioredis.from_url(self.redis_url, decode_responses=True)
+            # socket_timeout=None: redis-py 8.0 introduced a default 30s
+            # socket read timeout that would kill our long-blocking BRPOPs
+            # (server-side timeout=0). Restore the prior behavior explicitly.
+            self._redis = aioredis.from_url(
+                self.redis_url, decode_responses=True, socket_timeout=None,
+            )
         return self._redis
 
     # ---- ask ----

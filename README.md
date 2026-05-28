@@ -33,28 +33,37 @@ State of the art: stable, well-tested, production-grade for unattended runs of 1
 ## Architecture in one diagram
 
 ```
-┌─ Producer (Python) ─────────────────┐
-│                                     │
-│   async def main():                 │
-│     await bridge.ask(...)           │   ┌─ Redis (signal+queue) ─────────┐
-│       ► writes scratch.json         │   │  pool:foo:queue                │
-│       ► LPUSH queue   ──────────────┼──►│  pool:foo:work:<work_id>       │
-│       ► BLPOP result:<work_id> ◄────┼───│  pool:foo:result:<work_id>     │
-│       ► reads scratch.json          │   │  pool:foo:claim:<work_id>      │
-│       ► returns AskResult           │   └────────────────────────────────┘
-└─────────────────────────────────────┘                  ▲ │
-                                                         │ │ BRPOP atomic claim
-                                                         │ ▼
-                                ┌────────────────────────┴───────────┐
-                                │                                    │
-                       ┌─ Worker 1 (Claude) ─┐   ┌─ Worker 2 (Claude) ─┐ ...
-                       │  $ openbridge get   │   │  $ openbridge get   │
-                       │    edit scratch     │   │    edit scratch     │
-                       │  $ openbridge submit│   │  $ openbridge submit│
-                       └─────────────────────┘   └─────────────────────┘
+┌─ Producer (Python) ────────────────────────┐
+│                                            │
+│   async def main():                        │
+│     async with spawn_workers(bridge,       │
+│                              count=N):     │   ┌─ Redis (signal+queue) ──┐
+│       await bridge.ask(...)                │   │  pool:foo:queue         │
+│         ► writes scratch.json              │   │  pool:foo:work:<wid>    │
+│         ► LPUSH queue   ───────────────────┼──►│  pool:foo:result:<wid>  │
+│         ► BLPOP result:<wid> ◄─────────────┼───│  pool:foo:claim:<wid>   │
+│         ► reads scratch.json               │   └─────────────────────────┘
+│                                            │              ▲ │
+│   spawn_workers manages N claude           │              │ │ BRPOP atomic
+│   subprocesses (subscription, not API)     │              │ ▼
+└───────────────┬────────────────────────────┘   ┌──────────┴───────────┐
+                │ spawn + supervise              │                      │
+                ▼                                ▼                      ▼
+       ┌─ claude worker 1 ─┐   ┌─ claude worker 2 ─┐   ...
+       │ skill loaded via  │   │ skill loaded via  │
+       │ append-system-    │   │ append-system-    │
+       │ prompt-file       │   │ prompt-file       │
+       │ $ openbridge get  │   │ $ openbridge get  │
+       │   edit scratch    │   │   edit scratch    │
+       │ $ openbridge      │   │ $ openbridge      │
+       │   submit          │   │   submit          │
+       └───────────────────┘   └───────────────────┘
 ```
 
-The Python program is the source of truth (durable, on-disk state). Workers are stateless — they can come and go.
+The Python program is the source of truth (durable, on-disk state).
+Workers are stateless — they can come and go. With `spawn_workers` the
+producer launches its own Claude subprocesses automatically; you can
+also still run workers in separate terminals if you prefer.
 
 ---
 
@@ -68,7 +77,7 @@ cd openbridge
 pip install -e .
 ```
 
-Dependencies: Python 3.10+, `redis>=4.2`, and `docker` on `$PATH` (for the auto-bootstrap Redis container — opt out with `OPENBRIDGE_NO_DOCKER=1`).
+Dependencies: Python 3.10+, `redis>=4.2`, `docker` on `$PATH` (for the auto-bootstrap Redis container — opt out with `OPENBRIDGE_NO_DOCKER=1`), and **the `claude` CLI on `$PATH`** if you use `spawn_workers` (override location with `OPENBRIDGE_CLAUDE_BIN`).
 
 **Full setup walkthrough:** [`docs/SETUP.md`](docs/SETUP.md). Covers prerequisites, install, bring-your-own-Redis, troubleshooting.
 
@@ -88,12 +97,13 @@ each demonstrating one composable pattern. The full tour is in
 | 6 | Multi-producer, one pool | [`examples/06_multi_producer.py`](examples/06_multi_producer.py) |
 | 7 | Resume from disk after restart | [`examples/07_resume.py`](examples/07_resume.py) |
 
-### Write a producer
+### Write a producer (self-contained — workers spawn automatically)
 
 ```python
 # my_skill.py
 import asyncio
 from openbridge import Bridge
+from openbridge.spawn import spawn_workers
 
 bridge = Bridge(name="my-skill", pool="demo")
 
@@ -101,45 +111,78 @@ async def main():
     items = ["aurora", "candor", "lament", "ponder"]
     progress = bridge.checkpoint("progress", default={"done": []})
 
-    sem = asyncio.Semaphore(3)   # up to 3 items in flight at once
-    async def process(item):
-        async with sem:
-            if item in progress["done"]:
-                return
-            result = await bridge.ask(
-                item_id=item,
-                prompt=f"Classify {item!r} as noun/verb/adjective. Set submission.json.part_of_speech.",
-                template={"word": item, "part_of_speech": ""},
-                validate=lambda d: None if d.get("part_of_speech") in
-                    {"noun","verb","adjective"} else "must be noun/verb/adjective",
-            )
-            print(f"{item} → {result.data['part_of_speech']}")
-            progress["done"].append(item)
-            bridge.save("progress", progress)
+    async with spawn_workers(bridge, count=3):   # 3 claude sessions auto-spawned
+        sem = asyncio.Semaphore(3)
+        async def process(item):
+            async with sem:
+                if item in progress["done"]:
+                    return
+                result = await bridge.ask(
+                    item_id=item,
+                    prompt=f"Classify {item!r} as noun/verb/adjective. Set submission.json.part_of_speech.",
+                    template={"word": item, "part_of_speech": ""},
+                    validate=lambda d: None if d.get("part_of_speech") in
+                        {"noun","verb","adjective"} else "must be noun/verb/adjective",
+                )
+                print(f"{item} → {result.data['part_of_speech']}")
+                progress["done"].append(item)
+                bridge.save("progress", progress)
 
-    await asyncio.gather(*(process(i) for i in items))
+        await asyncio.gather(*(process(i) for i in items))
 
 bridge.serve(main())
 ```
 
-Run it (in any terminal):
+Run it (just one command, no second terminal needed):
 
 ```bash
 python my_skill.py
 ```
 
-### Drive it from Claude (any number of sessions)
+Three workers spawn, drain the pool in parallel, then exit cleanly.
 
-In each Claude session you want to use as a worker:
+### Recycle mode — bounded-context sessions
+
+For long-running batches where context bloat would eventually trigger
+compaction, pass `recycle=True`. Each session processes a bounded
+number of items (default: 1) then exits; a supervisor spawns a fresh
+replacement:
+
+```python
+# Recycle every item — cleanest context, highest startup overhead
+async with spawn_workers(bridge, count=4, recycle=True):
+    await producer_logic()
+
+# Recycle every 5 items — amortizes Claude startup over multiple items
+async with spawn_workers(bridge, count=4, recycle=True,
+                         max_jobs_per_session=5):
+    await producer_logic()
+```
+
+Pick `max_jobs_per_session` based on per-item context size:
+
+- `1` — large per-item context (long reads, many tool calls), or you
+  want maximum cleanliness.
+- `3–5` — typical text-classification / extraction batches.
+- `10+` — small per-item context; you just want a ceiling so a session
+  never runs forever.
+
+Trade-off: each spawn pays ~5–10s of Claude startup. With higher
+`max_jobs_per_session` you pay that less often, but each session
+accumulates more context before recycling.
+
+### Or: drive it manually from your own Claude sessions
+
+If you'd rather supply workers yourself (e.g. interactive Claude Code
+sessions you already have open), skip `spawn_workers` and run the CLI:
 
 ```bash
 openbridge get --pool demo
 # read the prompt, edit the submission.json path it names
 openbridge submit --pool demo --work-id <work_id_from_the_prompt>
-# repeat until the pool drains
 ```
 
-Three sessions = three items processed in parallel.
+Both modes can coexist on the same pool.
 
 ---
 
@@ -184,6 +227,28 @@ Disk-backed JSON state for crash recovery. The library never auto-saves; call `s
 ### `bridge.serve(coro)`
 
 Wrap your `main()`. Registers the producer in the pool, runs the coroutine, starts a background claim-reaper, GCs scratch files, and releases everything on exit.
+
+### `openbridge.spawn.spawn_workers(bridge, *, count, recycle=False)`
+
+Async context manager. Spawns `count` `claude` subprocesses with the bundled openbridge SKILL loaded via `--append-system-prompt-file`. Each subprocess runs autonomously (`--dangerously-skip-permissions`) and consumes from the producer's pool.
+
+Safety guarantees enforced unconditionally:
+
+- `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are stripped from the child env — sessions use your `claude` OAuth subscription, never per-token API billing.
+- `--dangerously-skip-permissions` is always passed; sessions are non-interactive and never block on permission prompts.
+- `claude` binary is found via `$OPENBRIDGE_CLAUDE_BIN`, then `$PATH`, then a short list of common install paths. Loud failure if missing.
+- Worker stdout/stderr stream to `<workdir>/workers/worker-N.log` (full `stream-json` transcripts) so the producer's console stays clean.
+
+Modes:
+
+- `recycle=False` (default) — each worker is a long-lived Claude session that loops through items until the pool drains. Fast per-item; one session accumulates context.
+- `recycle=True` — each worker processes up to `max_jobs_per_session` items (default 1) then exits; a supervisor immediately spawns a replacement. Bounded context per session, compaction can be avoided entirely. ~5–10s of Claude startup per spawn — raise `max_jobs_per_session` to amortize.
+
+Parameters:
+
+- `count: int` — number of worker slots to keep populated.
+- `recycle: bool = False` — enable bounded-context sessions.
+- `max_jobs_per_session: int = 1` — only used when `recycle=True`. Max items per session before exit + respawn. Use `1` for maximum context cleanliness; `3–10` to amortize startup cost over multiple items.
 
 ### `AskResult`
 
@@ -250,9 +315,17 @@ OpenBridge/
 │   ├── __main__.py           (python -m openbridge)
 │   ├── bridge.py             (Bridge class + ask/checkpoint/save/serve)
 │   ├── cli.py                (get/submit/skip/list/status/...)
-│   └── redis_runtime.py      (Docker auto-bootstrap)
+│   ├── spawn.py              (spawn_workers — auto-spawn claude subprocesses)
+│   ├── redis_runtime.py      (Docker auto-bootstrap)
+│   └── _skills/openbridge/SKILL.md  (bundled worker skill, loaded by spawn_workers)
+├── skills/
+│   ├── openbridge/SKILL.md         (canonical worker skill — for manual Claude sessions)
+│   └── openbridge-build/SKILL.md   (producer-authoring guide)
 ├── examples/
-│   └── word_classifier.py    (~30-line working example)
+│   ├── 01..07_*.py           (seven worked patterns)
+│   ├── 97_recycled_workers.py
+│   ├── 98_spawned_workers.py
+│   └── 99_local_smoketest.py
 └── tests/
     └── test_smoke.py         (end-to-end smoke tests)
 ```

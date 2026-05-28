@@ -12,6 +12,11 @@ under 10 minutes.
   container on first use). If you'd rather use your own Redis, you can
   skip Docker entirely — see [§3](#3-bring-your-own-redis).
 - **`pip`** capable of installing in editable mode (`pip install -e`).
+- **`claude` CLI on `$PATH`** *(only required if you use
+  `spawn_workers` to auto-spawn worker sessions)*. Install Claude Code
+  and log in once (`claude login`) — `spawn_workers` reuses that
+  subscription, never API billing. To override the binary location,
+  set `OPENBRIDGE_CLAUDE_BIN=/abs/path/to/claude`.
 
 Verify:
 
@@ -20,11 +25,19 @@ python3 --version       # ≥ 3.10.0
 docker --version        # any recent version
 docker info             # confirms the daemon is reachable
 pip --version
+claude --version        # only needed for spawn_workers
 ```
 
 If Docker complains "Cannot connect to the Docker daemon", start the
 Docker service (systemd: `sudo systemctl start docker`; macOS / Windows:
 launch Docker Desktop).
+
+If `claude` is not on `$PATH` but you have it installed, set
+`OPENBRIDGE_CLAUDE_BIN`:
+
+```bash
+export OPENBRIDGE_CLAUDE_BIN=$HOME/.local/bin/claude
+```
 
 ---
 
@@ -81,24 +94,42 @@ openbridge redis-down --remove # stop AND wipe the container
 
 ## 4. First run — verify end-to-end
 
-The repo ships with seven numbered examples in `examples/`, each
-demonstrating one pattern. Start with the simplest:
+The repo ships with worked examples in `examples/`. The numbered ones
+(`01..07`) are self-contained: each calls `spawn_workers` so a single
+command runs both producer and workers.
 
 ```bash
-# Terminal A — the producer
 python examples/01_serial_loop.py
 ```
 
 On first run, OpenBridge auto-bootstraps Redis (you'll see `[openbridge]
-launching new container openbridge-redis ...`), publishes work items
-into a pool called `word-classifier`, then blocks waiting for a worker.
+launching new container openbridge-redis ...`), then `spawn_workers`
+launches a `claude` subprocess that loads the bundled skill, claims
+work, edits the submission JSON, and submits. The producer's `await`
+resolves and the loop continues until done.
+
+Expected output (abbreviated):
+
+```
+[openbridge] spawned worker-0.gen0 (pid=...) → .word-classifier/workers/worker-0.log
+  aurora: noun
+  lament: verb
+  swift: adjective
+  ...
+done — 6 items processed sequentially
+```
+
+### Manual worker (no `spawn_workers`)
+
+If you'd rather drive the pool yourself from an interactive Claude
+session or shell, comment out the `async with spawn_workers(...)`
+wrapper in the example, run the producer, then in a second terminal:
 
 ```bash
-# Terminal B — the worker (simulating what a Claude session would do)
 openbridge get --pool word-classifier
 ```
 
-You'll see a prompt asking to classify a word, plus a footer:
+You'll see a prompt + footer:
 
 ```
 --- work_id: <uuid>
@@ -109,11 +140,8 @@ You'll see a prompt asking to classify a word, plus a footer:
 --- or:      openbridge skip --pool word-classifier --work-id <uuid> --reason ...
 ```
 
-Edit the file at `--- edit:` to set `part_of_speech` to `noun`, then run
-the `--- then:` command. Producer's `await` resumes; loops to next item.
-
-A **Claude session** loaded with `skills/openbridge/SKILL.md` would do
-exactly the above autonomously. From your side it's "just a CLI tool."
+Edit the file at `--- edit:` and run the `--- then:` command. Producer's
+`await` resumes; loops to next item.
 
 ---
 
